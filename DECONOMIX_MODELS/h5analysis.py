@@ -1,9 +1,11 @@
 import scanpy as sc
 import pandas as pd
+import os
 
 # Load the H5AD file
 print("Loading skin atlas data...")
-adata = sc.read_h5ad('Data/rna_data.h5ad')  
+p = os.path.join('Data','rna_data.h5ad')
+adata = sc.read_h5ad(p if os.path.exists(p) else 'rna_data.h5ad')  
 
 print("\n" + "=" * 70)
 print("BASIC INFORMATION")

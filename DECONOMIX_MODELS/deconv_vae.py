@@ -13,64 +13,97 @@ import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 import torch.nn.functional as F
 import warnings
+import os
+from tqdm import tqdm
+import torch.backends.cudnn as cudnn
 warnings.filterwarnings('ignore')
+use_precomputed = False
+prepared_dir = os.getenv('DECONOMIX_PREPARED')
+progress_enabled = os.getenv('DECONOMIX_PROGRESS', '1') != '0'
+
+# GPU / performance setup
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+try:
+    cudnn.benchmark = True
+    torch.set_float32_matmul_precision('high')
+except Exception:
+    pass
 
 print("="*70)
 print("VAE DECONVOLUTION - LATENT SPACE MODELING")
 print("="*70)
 
-print("\n[STEP 1] Loading skin atlas data...")
-adata = sc.read_h5ad('Data/rna_data.h5ad')
-adata_control = adata[adata.obs['disease'] == 'control'].copy()
+print("\n[STEP 1] Loading skin atlas data or precomputed arrays...")
+dataset_path = os.getenv('DECONOMIX_DATA', 'Data/rna_data.h5ad')
+if prepared_dir and os.path.exists(os.path.join(prepared_dir, 'X_train.npy')):
+    use_precomputed = True
+    print(f"Using precomputed arrays from: {prepared_dir}")
+    X_train_bulk = np.load(os.path.join(prepared_dir, 'X_train.npy'))
+    y_train_props = np.load(os.path.join(prepared_dir, 'y_train.npy'))
+    X_val_bulk = np.load(os.path.join(prepared_dir, 'X_val.npy'))
+    y_val_props = np.load(os.path.join(prepared_dir, 'y_val.npy'))
+    X_test_bulk = np.load(os.path.join(prepared_dir, 'X_test.npy'))
+    y_test_props = np.load(os.path.join(prepared_dir, 'y_test.npy'))
+    with open(os.path.join(prepared_dir, 'cell_types.txt'), 'r', encoding='utf-8') as f:
+        cell_types = [line.strip() for line in f if line.strip()]
+else:
+    adata = sc.read_h5ad(dataset_path)
+if not use_precomputed:
+    adata_control = adata[adata.obs['disease'] == 'control'].copy()
 
-immune_keywords = ['T cell', 'B cell', 'NK cell', 'Macrophage', 'Monocyte',
-                   'DC', 'Plasma cell', 'Mast cell']
-mask = adata_control.obs['cell_type'].str.lower().apply(
-    lambda x: any(k.lower() in x for k in immune_keywords)
-)
-adata_immune = adata_control[mask].copy()
+    immune_keywords = ['T cell', 'B cell', 'NK cell', 'Macrophage', 'Monocyte',
+                       'DC', 'Plasma cell', 'Mast cell']
+    mask = adata_control.obs['cell_type'].str.lower().apply(
+        lambda x: any(k.lower() in x for k in immune_keywords)
+    )
+    adata_immune = adata_control[mask].copy()
 
-print(f"Immune cells: {adata_immune.n_obs:,}")
+    print(f"Immune cells: {adata_immune.n_obs:,}")
 
-print("\n[STEP 2] Filtering to abundant cell types...")
+if not use_precomputed:
+    print("\n[STEP 2] Filtering to abundant cell types...")
 
-cell_type_counts = adata_immune.obs['cell_type'].value_counts()
-cell_type_props = cell_type_counts / len(adata_immune)
+if not use_precomputed:
+    cell_type_counts = adata_immune.obs['cell_type'].value_counts()
+    cell_type_props = cell_type_counts / len(adata_immune)
 
-min_proportion = 0.01
-major_cell_types = cell_type_props[cell_type_props >= min_proportion].index.tolist()
+    min_proportion = 0.01
+    major_cell_types = cell_type_props[cell_type_props >= min_proportion].index.tolist()
 
-print(f"\nKeeping {len(major_cell_types)} major cell types (>{min_proportion*100}%):")
-for ct in major_cell_types:
-    print(f"  {ct}")
+    print(f"\nKeeping {len(major_cell_types)} major cell types (>{min_proportion*100}%):")
+    for ct in major_cell_types:
+        print(f"  {ct}")
 
-adata_major = adata_immune[adata_immune.obs['cell_type'].isin(major_cell_types)].copy()
-print(f"\nFiltered to {adata_major.n_obs:,} cells in {len(major_cell_types)} cell types")
+    adata_major = adata_immune[adata_immune.obs['cell_type'].isin(major_cell_types)].copy()
+    print(f"\nFiltered to {adata_major.n_obs:,} cells in {len(major_cell_types)} cell types")
 
-print("\n[STEP 3] Selecting marker genes...")
+if not use_precomputed:
+    print("\n[STEP 3] Selecting marker genes...")
 
-adata_norm = adata_major.copy()
-sc.pp.normalize_total(adata_norm, target_sum=1e4)
-sc.pp.log1p(adata_norm)
+if not use_precomputed:
+    adata_norm = adata_major.copy()
+    sc.pp.normalize_total(adata_norm, target_sum=1e4)
+    sc.pp.log1p(adata_norm)
 
-sc.pp.highly_variable_genes(adata_norm, n_top_genes=1500, flavor='seurat_v3')
-hvg = adata_norm.var_names[adata_norm.var['highly_variable']].tolist()
+    sc.pp.highly_variable_genes(adata_norm, n_top_genes=1500, flavor='seurat_v3')
+    hvg = adata_norm.var_names[adata_norm.var['highly_variable']].tolist()
 
-sc.tl.rank_genes_groups(adata_norm, 'cell_type', method='wilcoxon')
+    sc.tl.rank_genes_groups(adata_norm, 'cell_type', method='wilcoxon')
 
-marker_genes = set()
-cell_types = sorted(major_cell_types)
+    marker_genes = set()
+    cell_types = sorted(major_cell_types)
 
-for ct in cell_types:
-    genes = sc.get.rank_genes_groups_df(adata_norm, group=ct).head(150)['names']
-    marker_genes.update(genes)
+    for ct in cell_types:
+        genes = sc.get.rank_genes_groups_df(adata_norm, group=ct).head(150)['names']
+        marker_genes.update(genes)
 
-selected_genes = sorted(list(set(hvg) | marker_genes))
-print(f"Selected genes: {len(selected_genes)}")
+    selected_genes = sorted(list(set(hvg) | marker_genes))
+    print(f"Selected genes: {len(selected_genes)}")
 
-adata_filtered = adata_major[:, selected_genes].copy()
+    adata_filtered = adata_major[:, selected_genes].copy()
 
-print("\n[STEP 4] Simulating pseudo-bulk samples...")
+if not use_precomputed:
+    print("\n[STEP 4] Simulating pseudo-bulk samples...")
 
 def simulate_bulk_advanced(adata, n_samples=10000, seed=42):
     np.random.seed(seed)
@@ -117,9 +150,10 @@ def simulate_bulk_advanced(adata, n_samples=10000, seed=42):
 
     return np.array(bulks), np.array(props)
 
-X_train_bulk, y_train_props = simulate_bulk_advanced(adata_filtered, n_samples=15000, seed=42)
-X_val_bulk, y_val_props = simulate_bulk_advanced(adata_filtered, n_samples=2000, seed=123)
-X_test_bulk, y_test_props = simulate_bulk_advanced(adata_filtered, n_samples=1000, seed=456)
+if not use_precomputed:
+    X_train_bulk, y_train_props = simulate_bulk_advanced(adata_filtered, n_samples=15000, seed=42)
+    X_val_bulk, y_val_props = simulate_bulk_advanced(adata_filtered, n_samples=2000, seed=123)
+    X_test_bulk, y_test_props = simulate_bulk_advanced(adata_filtered, n_samples=1000, seed=456)
 
 print(f"\nTraining: {X_train_bulk.shape}")
 print(f"Validation: {X_val_bulk.shape}")
@@ -222,6 +256,7 @@ n_cell_types = len(cell_types)
 
 model = VAEDeconvolution(n_genes, n_cell_types, latent_dim=128)
 print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+model.to(device)
 
 print("\n[STEP 6] Training VAE...")
 
@@ -238,7 +273,12 @@ X_test_t = torch.FloatTensor(X_test_scaled)
 y_test_t = torch.FloatTensor(y_test_props)
 
 train_dataset = TensorDataset(X_train_t, y_train_t)
-train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=256,
+    shuffle=True,
+    pin_memory=(device.type == 'cuda'),
+)
 
 optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=15, factor=0.5)
@@ -252,14 +292,24 @@ print("\nTraining progress:")
 print(f"{'Epoch':>6} {'Total Loss':>12} {'Recon':>10} {'KL':>10} {'Prop':>10} {'Val Corr':>12}")
 print("-" * 70)
 
-for epoch in range(n_epochs):
+epoch_iter = range(n_epochs)
+if progress_enabled:
+    epoch_iter = tqdm(epoch_iter, desc="Epochs", dynamic_ncols=True)
+
+for epoch in epoch_iter:
     model.train()
     total_loss_epoch = 0
     recon_loss_epoch = 0
     kl_loss_epoch = 0
     prop_loss_epoch = 0
 
-    for batch_X, batch_y in train_loader:
+    batch_iter = train_loader
+    if progress_enabled:
+        batch_iter = tqdm(train_loader, desc=f"Train {epoch+1}/{n_epochs}", leave=False, dynamic_ncols=True)
+
+    for batch_X, batch_y in batch_iter:
+        batch_X = batch_X.to(device, non_blocking=True)
+        batch_y = batch_y.to(device, non_blocking=True)
         optimizer.zero_grad()
 
         x_recon, proportions, mu, logvar = model(batch_X)
@@ -280,9 +330,16 @@ for epoch in range(n_epochs):
 
     model.eval()
     with torch.no_grad():
-        _, val_preds, _, _ = model(X_val_t)
-        val_preds = val_preds.numpy()
-        val_loss, _, _, _ = vae_loss(model(X_val_t)[0], X_val_t, model(X_val_t)[1], y_val_t, model(X_val_t)[2], model(X_val_t)[3])
+        x_val_recon, val_preds_t, mu_t, logvar_t = model(X_val_t.to(device))
+        val_preds = val_preds_t.detach().cpu().numpy()
+        val_loss, _, _, _ = vae_loss(
+            x_val_recon,
+            X_val_t.to(device),
+            val_preds_t,
+            y_val_t.to(device),
+            mu_t,
+            logvar_t,
+        )
         val_loss = val_loss.item()
 
         val_corrs = []
@@ -293,20 +350,29 @@ for epoch in range(n_epochs):
 
     scheduler.step(val_loss)
 
+    if progress_enabled:
+        try:
+            epoch_iter.set_postfix(total=f"{total_loss_epoch:.4f}", recon=f"{recon_loss_epoch:.4f}", kl=f"{kl_loss_epoch:.4f}", prop=f"{prop_loss_epoch:.4f}", corr=f"{avg_val_corr:.3f}")
+        except Exception:
+            pass
+
     if (epoch + 1) % 10 == 0:
         print(f"{epoch+1:6d} {total_loss_epoch:12.6f} {recon_loss_epoch:10.4f} {kl_loss_epoch:10.4f} {prop_loss_epoch:10.4f} {avg_val_corr:12.3f}")
 
     if val_loss < best_val_loss:
         best_val_loss = val_loss
         patience_counter = 0
-        torch.save(model.state_dict(), 'best_model_vae.pth')
+        outdir = os.getenv('DECONOMIX_OUTDIR', '.')
+        os.makedirs(outdir, exist_ok=True)
+        torch.save(model.state_dict(), os.path.join(outdir, 'best_model_vae.pth'))
     else:
         patience_counter += 1
         if patience_counter >= max_patience:
             print(f"\nEarly stopping at epoch {epoch+1}")
             break
 
-model.load_state_dict(torch.load('best_model_vae.pth'))
+outdir = os.getenv('DECONOMIX_OUTDIR', '.')
+model.load_state_dict(torch.load(os.path.join(outdir, 'best_model_vae.pth')))
 
 print("\n" + "="*70)
 print("FINAL EVALUATION - VAE")
@@ -314,8 +380,8 @@ print("="*70)
 
 model.eval()
 with torch.no_grad():
-    _, test_predictions, test_mu, test_logvar = model(X_test_t)
-    test_predictions = test_predictions.numpy()
+    _, test_predictions_t, test_mu, test_logvar = model(X_test_t.to(device))
+    test_predictions = test_predictions_t.detach().cpu().numpy()
 
 print(f"\n{'Cell Type':<30} {'Spearman ρ':>12} {'MAE':>10} {'Avg Prop':>10}")
 print("-" * 64)
@@ -359,14 +425,14 @@ for idx in range(len(cell_types), 9):
 plt.suptitle(f'VAE Deconvolution - Avg ρ = {avg_corr:.3f}',
              fontsize=16, fontweight='bold')
 plt.tight_layout()
-plt.savefig('vae_deconvolution.png', dpi=300, bbox_inches='tight')
-print("Saved: vae_deconvolution.png")
+plt.savefig(os.path.join(outdir, 'vae_deconvolution.png'), dpi=300, bbox_inches='tight')
+print(f"Saved: {os.path.join(outdir, 'vae_deconvolution.png')}")
 
 print("\n[Analyzing latent space...]")
 from sklearn.manifold import TSNE
 
 with torch.no_grad():
-    latent_z = test_mu.numpy()
+    latent_z = test_mu.detach().cpu().numpy()
 
 dominant_ct = np.argmax(y_test_props, axis=1)
 
@@ -382,8 +448,8 @@ plt.xlabel('t-SNE 1')
 plt.ylabel('t-SNE 2')
 plt.grid(True, alpha=0.3)
 plt.tight_layout()
-plt.savefig('vae_latent_space.png', dpi=300, bbox_inches='tight')
-print("Saved: vae_latent_space.png")
+plt.savefig(os.path.join(outdir, 'vae_latent_space.png'), dpi=300, bbox_inches='tight')
+print(f"Saved: {os.path.join(outdir, 'vae_latent_space.png')}")
 
 perf_df = pd.DataFrame({
     'cell_type': cell_types,
@@ -391,7 +457,7 @@ perf_df = pd.DataFrame({
     'mae': mae_scores,
     'mean_proportion': y_test_props.mean(axis=0)
 })
-perf_df.to_csv('performance_vae.csv', index=False)
+perf_df.to_csv(os.path.join(outdir, 'performance_vae.csv'), index=False)
 
 print("\n" + "="*70)
 print("VAE COMPLETE")

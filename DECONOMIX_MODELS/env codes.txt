@@ -1,0 +1,3 @@
+$env:DECONOMIX_PREPARED = (Resolve-Path .\Data\prepared).Path
+$env:DECONOMIX_DATA = (Resolve-Path .\Data\rna_data.h5ad).Path
+$env:DECONOMIX_OUTDIR = (Resolve-Path .\results).Path

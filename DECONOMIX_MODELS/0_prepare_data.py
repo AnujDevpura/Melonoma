@@ -12,7 +12,8 @@ print("="*60)
 
 # 1. LOAD AND FILTER
 print("\n[1/4] Loading Atlas Data...")
-adata = sc.read_h5ad('Data/rna_data.h5ad')
+p = os.path.join('Data','rna_data.h5ad')
+adata = sc.read_h5ad(p if os.path.exists(p) else 'rna_data.h5ad')
 adata = adata[adata.obs['disease'] == 'control'].copy()
 
 # Filter for Immune Cells

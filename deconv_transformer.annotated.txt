@@ -1,0 +1,540 @@
+   1 import scanpy as sc
+   1 import numpy as np
+   1 import pandas as pd
+   1 from scipy.stats import spearmanr
+   1 import matplotlib.pyplot as plt
+   1 from sklearn.metrics import mean_absolute_error
+   1 from sklearn.preprocessing import RobustScaler
+   1 import torch
+   1 import torch.nn as nn
+   1 import torch.optim as optim
+   1 from torch.utils.data import TensorDataset, DataLoader
+   1 import warnings
+   1 import os
+   1 from tqdm import tqdm
+   1 import torch.backends.cudnn as cudnn
+   1 from torch.optim.lr_scheduler import OneCycleLR
+   1 from torch.cuda.amp import autocast, GradScaler
+   1 from copy import deepcopy
+   1 import random, json, pickle
+   1 warnings.filterwarnings('ignore')
+   1 use_precomputed = False
+   1 prepared_dir = os.getenv('DECONOMIX_PREPARED')
+   1 progress_enabled = os.getenv('DECONOMIX_PROGRESS', '1') != '0'
+   1 
+   1 # GPU / performance setup
+   1 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+   1 try:
+   1     cudnn.benchmark = True
+   1     torch.set_float32_matmul_precision('high')
+   1 except Exception:
+   1     pass
+   1 
+   1 # Optional reproducibility via env DECONOMIX_SEED
+   1 seed_env = os.getenv('DECONOMIX_SEED')
+   1 if seed_env is not None:
+   1     try:
+   1         seed = int(seed_env)
+   1         random.seed(seed)
+   1         np.random.seed(seed)
+   1         torch.manual_seed(seed)
+   1         if torch.cuda.is_available():
+   1             torch.cuda.manual_seed_all(seed)
+   1             cudnn.deterministic = True
+   1             cudnn.benchmark = False
+   1     except Exception:
+   1         pass
+   1 
+   1 print("="*70)
+   1 print("TRANSFORMER DECONVOLUTION")
+   1 print("="*70)
+   1 
+   1 print("\n[STEP 1] Loading skin atlas data or precomputed arrays...")
+   1 dataset_path = os.getenv('DECONOMIX_DATA', 'Data/rna_data.h5ad')
+   1 if prepared_dir and os.path.exists(os.path.join(prepared_dir, 'X_train.npy')):
+   1     use_precomputed = True
+   1     print(f"Using precomputed arrays from: {prepared_dir}")
+   1     X_train_bulk = np.load(os.path.join(prepared_dir, 'X_train.npy'))
+   1     y_train_props = np.load(os.path.join(prepared_dir, 'y_train.npy'))
+   1     X_val_bulk = np.load(os.path.join(prepared_dir, 'X_val.npy'))
+   1     y_val_props = np.load(os.path.join(prepared_dir, 'y_val.npy'))
+   1     X_test_bulk = np.load(os.path.join(prepared_dir, 'X_test.npy'))
+   1     y_test_props = np.load(os.path.join(prepared_dir, 'y_test.npy'))
+   1     with open(os.path.join(prepared_dir, 'cell_types.txt'), 'r', encoding='utf-8') as f:
+   1         cell_types = [line.strip() for line in f if line.strip()]
+   1 else:
+   1     adata = sc.read_h5ad(dataset_path)
+   1 if not use_precomputed:
+   1     adata_control = adata[adata.obs['disease'] == 'control'].copy()
+   1 
+   1     immune_keywords = ['T cell', 'B cell', 'NK cell', 'Macrophage', 'Monocyte',
+   1                        'DC', 'Plasma cell', 'Mast cell']
+   1     mask = adata_control.obs['cell_type'].str.lower().apply(
+   1         lambda x: any(k.lower() in x for k in immune_keywords)
+   1     )
+   1     adata_immune = adata_control[mask].copy()
+   1 
+   1     print(f"Immune cells: {adata_immune.n_obs:,}")
+   1 
+   1 if not use_precomputed:
+   1     print("\n[STEP 2] Filtering to abundant cell types...")
+   1 
+   1 if not use_precomputed:
+   1     cell_type_counts = adata_immune.obs['cell_type'].value_counts()
+   1     cell_type_props = cell_type_counts / len(adata_immune)
+   1 
+   1     min_proportion = 0.01
+   1     major_cell_types = cell_type_props[cell_type_props >= min_proportion].index.tolist()
+   1 
+   1     print(f"\nKeeping {len(major_cell_types)} major cell types (>{min_proportion*100}%):")
+   1     for ct in major_cell_types:
+   1         print(f"  {ct}")
+   1 
+   1     adata_major = adata_immune[adata_immune.obs['cell_type'].isin(major_cell_types)].copy()
+   1     print(f"\nFiltered to {adata_major.n_obs:,} cells in {len(major_cell_types)} cell types")
+   1 
+   1 if not use_precomputed:
+   1     print("\n[STEP 3] Selecting marker genes...")
+   1 
+   1 if not use_precomputed:
+   1     adata_norm = adata_major.copy()
+   1     sc.pp.normalize_total(adata_norm, target_sum=1e4)
+   1     sc.pp.log1p(adata_norm)
+   1 
+   1     sc.pp.highly_variable_genes(adata_norm, n_top_genes=1500, flavor='seurat_v3')
+   1     hvg = adata_norm.var_names[adata_norm.var['highly_variable']].tolist()
+   1 
+   1     sc.tl.rank_genes_groups(adata_norm, 'cell_type', method='wilcoxon')
+   1 
+   1     marker_genes = set()
+   1     cell_types = sorted(major_cell_types)
+   1 
+   1     for ct in cell_types:
+   1         genes = sc.get.rank_genes_groups_df(adata_norm, group=ct).head(150)['names']
+   1         marker_genes.update(genes)
+   1 
+   1     selected_genes = sorted(list(set(hvg) | marker_genes))
+   1     print(f"Selected genes: {len(selected_genes)}")
+   1 
+   1     adata_filtered = adata_major[:, selected_genes].copy()
+   1 
+   1 # ============================================================================
+   1 # STEP 4: SIMULATE TRAINING DATA
+   1 # ============================================================================
+   1 if not use_precomputed:
+   1     print("\n[STEP 4] Simulating pseudo-bulk samples...")
+   1 
+   1 def simulate_bulk_advanced(adata, n_samples=10000, seed=42):
+   1     np.random.seed(seed)
+   1 
+   1     if hasattr(adata.X, 'toarray'):
+   1         X_data = adata.X.toarray()
+   1     else:
+   1         X_data = np.array(adata.X)
+   1 
+   1     is_logged = X_data.max() < 20
+   1     if is_logged:
+   1         X_data = np.expm1(X_data)
+   1 
+   1     cell_type_array = adata.obs['cell_type'].values
+   1     cell_types_list = sorted(adata.obs['cell_type'].unique())
+   1 
+   1     bulks = []
+   1     props = []
+   1 
+   1     print(f"Generating {n_samples} samples...")
+   1     for i in range(n_samples):
+   1         if (i + 1) % 2000 == 0:
+   1             print(f"  {i+1}/{n_samples}...")
+   1 
+   1         n_cells = np.random.randint(500, 3000)
+   1         indices = np.random.choice(adata.n_obs, n_cells, replace=True)
+   1         cells = X_data[indices, :]
+   1 
+   1         bulk = cells.sum(axis=0)
+   1 
+   1         noise_level = np.random.uniform(0.01, 0.05)
+   1         bulk = bulk * (1 + np.random.normal(0, noise_level, bulk.shape))
+   1         bulk = np.maximum(bulk, 0)
+   1 
+   1         bulk = bulk / (bulk.sum() + 1e-9) * 1e6
+   1 
+   1         bulks.append(bulk)
+   1 
+   1         sampled_cts = cell_type_array[indices]
+   1         unique, counts = np.unique(sampled_cts, return_counts=True)
+   1         prop_dict = dict(zip(unique, counts / n_cells))
+   1         prop_vec = [prop_dict.get(ct, 0.0) for ct in cell_types_list]
+   1         props.append(prop_vec)
+   1 
+   1     return np.array(bulks), np.array(props)
+   1 
+   1 if not use_precomputed:
+   1     X_train_bulk, y_train_props = simulate_bulk_advanced(adata_filtered, n_samples=15000, seed=42)
+   1     X_val_bulk, y_val_props = simulate_bulk_advanced(adata_filtered, n_samples=2000, seed=123)
+   1     X_test_bulk, y_test_props = simulate_bulk_advanced(adata_filtered, n_samples=1000, seed=456)
+   1 
+   1 print(f"\nTraining: {X_train_bulk.shape}")
+   1 print(f"Validation: {X_val_bulk.shape}")
+   1 print(f"Test: {X_test_bulk.shape}")
+   1 
+   1 print("\n[STEP 5] Building Transformer model...")
+   1 
+   1 class MultiHeadAttention(nn.Module):
+   1     def __init__(self, d_model, num_heads):
+   1         super(MultiHeadAttention, self).__init__()
+   1         assert d_model % num_heads == 0
+   1 
+   1         self.d_model = d_model
+   1         self.num_heads = num_heads
+   1         self.d_k = d_model // num_heads
+   1 
+   1         self.W_q = nn.Linear(d_model, d_model)
+   1         self.W_k = nn.Linear(d_model, d_model)
+   1         self.W_v = nn.Linear(d_model, d_model)
+   1         self.W_o = nn.Linear(d_model, d_model)
+   1 
+   1     def forward(self, x):
+   1         batch_size = x.size(0)
+   1 
+   1         Q = self.W_q(x).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+   1         K = self.W_k(x).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+   1         V = self.W_v(x).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+   1 
+   1         scores = torch.matmul(Q, K.transpose(-2, -1)) / np.sqrt(self.d_k)
+   1         attn = torch.softmax(scores, dim=-1)
+   1         context = torch.matmul(attn, V)
+   1 
+   1         context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
+   1         output = self.W_o(context)
+   1 
+   1         return output
+   1 
+   1 class TransformerBlock(nn.Module):
+   1     def __init__(self, d_model, num_heads, d_ff, dropout=0.3):
+   1         super(TransformerBlock, self).__init__()
+   1 
+   1         self.attention = MultiHeadAttention(d_model, num_heads)
+   1         self.norm1 = nn.LayerNorm(d_model)
+   1         self.norm2 = nn.LayerNorm(d_model)
+   1 
+   1         self.feed_forward = nn.Sequential(
+   1             nn.Linear(d_model, d_ff),
+   1             nn.GELU(),
+   1             nn.Dropout(dropout),
+   1             nn.Linear(d_ff, d_model)
+   1         )
+   1 
+   1         self.dropout = nn.Dropout(dropout)
+   1 
+   1     def forward(self, x):
+   1         attn_output = self.attention(x)
+   1         x = self.norm1(x + self.dropout(attn_output))
+   1 
+   1         ff_output = self.feed_forward(x)
+   1         x = self.norm2(x + self.dropout(ff_output))
+   1 
+   1         return x
+   1 
+   1 class TransformerDeconvolution(nn.Module):
+   1     def __init__(self, n_genes, n_cell_types, d_model=512, num_heads=8, num_layers=4, chunk_size=128):
+   1         super(TransformerDeconvolution, self).__init__()
+   1 
+   1         self.chunk_size = chunk_size
+   1         self.n_chunks = (n_genes + chunk_size - 1) // chunk_size
+   1 
+   1         self.gene_embedding = nn.Linear(chunk_size, d_model)
+   1 
+   1         self.pos_embedding = nn.Parameter(torch.randn(1, self.n_chunks, d_model))
+   1 
+   1         self.transformer_blocks = nn.ModuleList([
+   1             TransformerBlock(d_model, num_heads, d_ff=d_model*4, dropout=0.3)
+   1             for _ in range(num_layers)
+   1         ])
+   1 
+   1         self.global_pool = nn.AdaptiveAvgPool1d(1)
+   1 
+   1         self.decoder = nn.Sequential(
+   1             nn.Linear(d_model, 512),
+   1             nn.LayerNorm(512),
+   1             nn.GELU(),
+   1             nn.Dropout(0.3),
+   1 
+   1             nn.Linear(512, 256),
+   1             nn.LayerNorm(256),
+   1             nn.GELU(),
+   1             nn.Dropout(0.2),
+   1 
+   1             nn.Linear(256, n_cell_types),
+   1             nn.Softmax(dim=1)
+   1         )
+   1 
+   1     def forward(self, x):
+   1         batch_size = x.size(0)
+   1 
+   1         n_genes = x.size(1)
+   1         pad_size = (self.chunk_size - n_genes % self.chunk_size) % self.chunk_size
+   1         if pad_size > 0:
+   1             x = torch.cat([x, torch.zeros(batch_size, pad_size, device=x.device)], dim=1)
+   1 
+   1         x = x.view(batch_size, self.n_chunks, self.chunk_size)
+   1 
+   1         x = self.gene_embedding(x)
+   1 
+   1         x = x + self.pos_embedding
+   1 
+   1         for transformer in self.transformer_blocks:
+   1             x = transformer(x)
+   1 
+   1         x = x.transpose(1, 2)
+   1         x = self.global_pool(x).squeeze(-1)
+   1 
+   1         output = self.decoder(x)
+   1 
+   1         return output
+   1 
+   1 n_genes = X_train_bulk.shape[1]
+   1 n_cell_types = len(cell_types)
+   1 
+   1 model = TransformerDeconvolution(n_genes, n_cell_types, d_model=512, num_heads=8, num_layers=4)
+   1 print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+   1 model.to(device)
+   1 
+   1 # EMA model for smoother validation and checkpoints
+   1 ema_decay = float(os.getenv('DECONOMIX_EMA_DECAY', '0.999'))
+   1 ema_model = deepcopy(model).to(device)
+   1 for p in ema_model.parameters():
+   1     p.requires_grad_(False)
+   1 
+   1 @torch.no_grad()
+   1 def ema_update(ema_m, model_m, decay: float):
+   1     for p_ema, p in zip(ema_m.parameters(), model_m.parameters()):
+   1         p_ema.data.mul_(decay).add_(p.data, alpha=1.0 - decay)
+   1 
+   1 print("\n[STEP 6] Training...")
+   1 
+   1 scaler = RobustScaler()
+   1 X_train_scaled = scaler.fit_transform(X_train_bulk)
+   1 X_val_scaled = scaler.transform(X_val_bulk)
+   1 X_test_scaled = scaler.transform(X_test_bulk)
+   1 
+   1 X_train_t = torch.FloatTensor(X_train_scaled)
+   1 y_train_t = torch.FloatTensor(y_train_props)
+   1 X_val_t = torch.FloatTensor(X_val_scaled)
+   1 y_val_t = torch.FloatTensor(y_val_props)
+   1 X_test_t = torch.FloatTensor(X_test_scaled)
+   1 y_test_t = torch.FloatTensor(y_test_props)
+   1 
+   1 train_dataset = TensorDataset(X_train_t, y_train_t)
+   1 batch_size = int(os.getenv('DECONOMIX_BATCH', '512'))
+   1 train_loader = DataLoader(
+   1     train_dataset,
+   1     batch_size=batch_size,
+   1     shuffle=True,
+   1     pin_memory=(device.type == 'cuda'),
+   1 )
+   1 
+   1 eps = 1e-6
+   1 avg_props = y_train_props.mean(axis=0)
+   1 class_weights_np = 1.0 / (avg_props + eps)
+   1 class_weights_np = class_weights_np / class_weights_np.mean()
+   1 cap = float(os.getenv('DECONOMIX_WEIGHT_CAP', '3.0'))
+   1 if cap > 0:
+   1     class_weights_np = np.minimum(class_weights_np, cap)
+   1 class_weights = torch.tensor(class_weights_np, dtype=torch.float32, device=device)
+   1 
+   1 label_smooth = float(os.getenv('DECONOMIX_LABEL_SMOOTH', '0.01'))
+   1 
+   1 def apply_label_smoothing(y: torch.Tensor, smooth: float) -> torch.Tensor:
+   1     if smooth <= 0:
+   1         return y
+   1     c = y.size(1)
+   1     return (1.0 - smooth) * y + smooth / c
+   1 
+   1 def weighted_mse(pred, target):
+   1     loss = (pred - target) ** 2
+   1     loss = loss * class_weights
+   1     return loss.mean()
+   1 
+   1 optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
+   1 
+   1 n_epochs = 200
+   1 best_val_corr = -1.0
+   1 patience_counter = 0
+   1 max_patience = 60
+   1 scaler_amp = GradScaler(enabled=(device.type == 'cuda'))
+   1 scheduler = OneCycleLR(optimizer, max_lr=0.001, epochs=n_epochs, steps_per_epoch=len(train_loader))
+   1 mixup_alpha = float(os.getenv('DECONOMIX_MIXUP_ALPHA', '0.0'))
+   1 use_mixup = mixup_alpha > 0
+   1 
+   1 print("\nTraining progress:")
+   1 print(f"{'Epoch':>6} {'Train Loss':>12} {'Val Loss':>12} {'Val Corr':>12}")
+   1 print("-" * 48)
+   1 
+   1 epoch_iter = range(n_epochs)
+   1 if progress_enabled:
+   1     epoch_iter = tqdm(epoch_iter, desc="Epochs", dynamic_ncols=True)
+   1 
+   1 for epoch in epoch_iter:
+   1     model.train()
+   1     train_loss = 0
+   1     batch_iter = train_loader
+   1     if progress_enabled:
+   1         batch_iter = tqdm(train_loader, desc=f"Train {epoch+1}/{n_epochs}", leave=False, dynamic_ncols=True)
+   1 
+   1     for batch_X, batch_y in batch_iter:
+   1         batch_X = batch_X.to(device, non_blocking=True)
+   1         batch_y = batch_y.to(device, non_blocking=True)
+   1         optimizer.zero_grad(set_to_none=True)
+   1         # Optional MixUp
+   1         if use_mixup:
+   1             lam = np.random.beta(mixup_alpha, mixup_alpha)
+   1             idx = torch.randperm(batch_X.size(0), device=device)
+   1             batch_X_m = lam * batch_X + (1.0 - lam) * batch_X[idx]
+   1             batch_y_m = lam * batch_y + (1.0 - lam) * batch_y[idx]
+   1         else:
+   1             batch_X_m, batch_y_m = batch_X, batch_y
+   1         # Label smoothing
+   1         batch_y_m = apply_label_smoothing(batch_y_m, label_smooth)
+   1         with autocast(enabled=(device.type == 'cuda')):
+   1             outputs = model(batch_X_m)
+   1             loss = weighted_mse(outputs, batch_y_m)
+   1         scaler_amp.scale(loss).backward()
+   1         scaler_amp.step(optimizer)
+   1         scaler_amp.update()
+   1         scheduler.step()
+   1         ema_update(ema_model, model, ema_decay)
+   1         train_loss += loss.item()
+   1 
+   1     train_loss /= len(train_loader)
+   1 
+   1     model.eval()
+   1     with torch.no_grad(), autocast(enabled=(device.type == 'cuda')):
+   1         # Validate with EMA weights
+   1         val_out = ema_model(X_val_t.to(device))
+   1         val_preds = val_out.detach().cpu().numpy()
+   1         val_loss = weighted_mse(val_out, y_val_t.to(device)).item()
+   1 
+   1         val_corrs = []
+   1         for i in range(n_cell_types):
+   1             corr, _ = spearmanr(y_val_props[:, i], val_preds[:, i])
+   1             val_corrs.append(corr)
+   1         avg_val_corr = np.mean(val_corrs)
+   1 
+   1     # OneCycleLR is stepped per batch; no val step here
+   1 
+   1     if progress_enabled:
+   1         try:
+   1             epoch_iter.set_postfix(train=f"{train_loss:.4f}", val=f"{val_loss:.4f}", corr=f"{avg_val_corr:.3f}")
+   1         except Exception:
+   1             pass
+   1 
+   1     if (epoch + 1) % 10 == 0:
+   1         print(f"{epoch+1:6d} {train_loss:12.6f} {val_loss:12.6f} {avg_val_corr:12.3f}")
+   1 
+   1     if avg_val_corr > best_val_corr + 1e-4:
+   1         best_val_corr = avg_val_corr
+   1         patience_counter = 0
+   1         outdir = os.getenv('DECONOMIX_OUTDIR', '.')
+   1         os.makedirs(outdir, exist_ok=True)
+   1         # Save EMA weights as checkpoint
+   1         torch.save(ema_model.state_dict(), os.path.join(outdir, 'best_model_transformer.pth'))
+   1         try:
+   1             with open(os.path.join(outdir, 'transformer_scaler.pkl'), 'wb') as f:
+   1                 pickle.dump(scaler, f)
+   1             cfg = {
+   1                 'batch_size': batch_size,
+   1                 'optimizer': 'AdamW',
+   1                 'lr_max': 0.001,
+   1                 'weight_decay': 1e-4,
+   1                 'epochs': n_epochs,
+   1                 'scheduler': 'OneCycleLR',
+   1                 'class_weights': class_weights_np.tolist(),
+   1                 'best_val_corr': float(best_val_corr),
+   1                 'ema_decay': ema_decay,
+   1                 'mixup_alpha': mixup_alpha,
+   1                 'label_smooth': label_smooth,
+   1                 'seed': seed_env,
+   1             }
+   1             with open(os.path.join(outdir, 'transformer_config.json'), 'w', encoding='utf-8') as f:
+   1                 json.dump(cfg, f, indent=2)
+   1         except Exception:
+   1             pass
+   1     else:
+   1         patience_counter += 1
+   1         if patience_counter >= max_patience:
+   1             print(f"\nEarly stopping at epoch {epoch+1}")
+   1             break
+   1 
+   1 outdir = os.getenv('DECONOMIX_OUTDIR', '.')
+   1 model.load_state_dict(torch.load(os.path.join(outdir, 'best_model_transformer.pth')))
+   1 
+   1 print("\n" + "="*70)
+   1 print("FINAL EVALUATION")
+   1 print("="*70)
+   1 
+   1 model.eval()
+   1 with torch.no_grad():
+   1     test_predictions = model(X_test_t.to(device)).detach().cpu().numpy()
+   1 
+   1 print(f"\n{'Cell Type':<30} {'Spearman ρ':>12} {'MAE':>10} {'Avg Prop':>10}")
+   1 print("-" * 64)
+   1 
+   1 correlations = []
+   1 mae_scores = []
+   1 
+   1 for i, ct in enumerate(cell_types):
+   1     corr, _ = spearmanr(y_test_props[:, i], test_predictions[:, i])
+   1     correlations.append(corr)
+   1 
+   1     mae = mean_absolute_error(y_test_props[:, i], test_predictions[:, i])
+   1     mae_scores.append(mae)
+   1 
+   1     avg_prop = y_test_props[:, i].mean()
+   1 
+   1     print(f"{ct:<30} {corr:>12.3f} {mae:>10.4f} {avg_prop:>10.4f}")
+   1 
+   1 print("-" * 64)
+   1 avg_corr = np.mean(correlations)
+   1 print(f"{'AVERAGE':<30} {avg_corr:>12.3f} {np.mean(mae_scores):>10.4f}")
+   1 
+   1 print("\n[Creating visualizations...]")
+   1 
+   1 fig, axes = plt.subplots(3, 3, figsize=(18, 15))
+   1 axes = axes.flatten()
+   1 
+   1 for idx, i in enumerate(range(min(9, len(cell_types)))):
+   1     ax = axes[idx]
+   1     ax.scatter(y_test_props[:, i], test_predictions[:, i], alpha=0.5, s=30, c='coral')
+   1     ax.plot([0, 1], [0, 1], 'r--', linewidth=2)
+   1 
+   1     ax.set_xlabel('True Proportion', fontsize=10)
+   1     ax.set_ylabel('Predicted Proportion', fontsize=10)
+   1     ax.set_title(f'{cell_types[i]}\nρ = {correlations[i]:.3f}', fontsize=11)
+   1     ax.grid(True, alpha=0.3)
+   1 
+   1 for idx in range(len(cell_types), 9):
+   1     axes[idx].axis('off')
+   1 
+   1 plt.suptitle(f'Transformer Deconvolution - Avg ρ = {avg_corr:.3f}',
+   1              fontsize=16, fontweight='bold')
+   1 plt.tight_layout()
+   1 plt.savefig(os.path.join(outdir, 'transformer_deconvolution.png'), dpi=300, bbox_inches='tight')
+   1 print(f"Saved: {os.path.join(outdir, 'transformer_deconvolution.png')}")
+   1 
+   1 perf_df = pd.DataFrame({
+   1     'cell_type': cell_types,
+   1     'spearman_correlation': correlations,
+   1     'mae': mae_scores,
+   1     'mean_proportion': y_test_props.mean(axis=0)
+   1 })
+   1 perf_df.to_csv(os.path.join(outdir, 'performance_transformer.csv'), index=False)
+   1 
+   1 print("\n" + "="*70)
+   1 print("TRANSFORMER COMPLETE")
+   1 print("="*70)
+   1 print(f"\nFINAL RESULTS:")
+   1 print(f"  Average Spearman: {avg_corr:.3f}")
+   1 print(f"  Architecture: Multi-head attention with {sum(p.numel() for p in model.parameters()):,} parameters")
+   1 
+   1 print("\n" + "="*70)

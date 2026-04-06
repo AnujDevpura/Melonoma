@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 import warnings
+import os
 warnings.filterwarnings('ignore')
 
 print("="*70)
@@ -17,7 +18,8 @@ print("DEEP LEARNING DECONVOLUTION - SMART FILTERING")
 print("="*70)
 
 print("\n[STEP 1] Loading skin atlas data...")
-adata = sc.read_h5ad('Data/rna_data.h5ad')
+p = os.path.join('Data','rna_data.h5ad')
+adata = sc.read_h5ad(p if os.path.exists(p) else 'rna_data.h5ad')
 adata_control = adata[adata.obs['disease'] == 'control'].copy()
 
 immune_keywords = ['T cell', 'B cell', 'NK cell', 'Macrophage', 'Monocyte',

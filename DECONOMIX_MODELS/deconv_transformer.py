@@ -10,67 +10,158 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 import warnings
+import os
+import argparse
+from tqdm import tqdm
+import torch.backends.cudnn as cudnn
+from torch.optim.lr_scheduler import OneCycleLR
+from torch.cuda.amp import autocast, GradScaler
+from copy import deepcopy
+import random, json, pickle
+import torch.nn.functional as F
+from torch.optim.swa_utils import AveragedModel
 warnings.filterwarnings('ignore')
+use_precomputed = False
+
+# Optional JSON config support (overrides env defaults when provided)
+parser = argparse.ArgumentParser(description='Transformer deconvolution')
+parser.add_argument('--config', help='Path to JSON config for data/run/train/model settings')
+known, _ = parser.parse_known_args()
+CFG = None
+if known.config:
+    import json
+    with open(known.config, 'r', encoding='utf-8-sig') as f:
+        CFG = json.load(f)
+else:
+    # Load default config next to this script if present
+    default_cfg = os.path.join(os.path.dirname(__file__), 'configs', 'transformer.json')
+    if os.path.exists(default_cfg):
+        import json
+        with open(default_cfg, 'r', encoding='utf-8-sig') as f:
+            CFG = json.load(f)
+        print(f"[Config] Using default config: {default_cfg}")
+
+def cfg_get(path, env_key=None, default=None):
+    # path like ('data','prepared')
+    if CFG is not None:
+        d = CFG
+        for k in path:
+            if not isinstance(d, dict) or k not in d:
+                break
+            d = d[k]
+        else:
+            return d
+    if env_key is not None:
+        return os.getenv(env_key, default)
+    return default
+
+prepared_dir = cfg_get(('data','prepared'), 'DECONOMIX_PREPARED', None)
+dataset_path = cfg_get(('data','h5ad'), 'DECONOMIX_DATA', 'Data/rna_data.h5ad')
+outdir = cfg_get(('run','outdir'), 'DECONOMIX_OUTDIR', '.')
+os.makedirs(outdir, exist_ok=True)
+progress_enabled = bool(cfg_get(('run','progress'), 'DECONOMIX_PROGRESS', '1') != '0')
+seed_env = cfg_get(('run','seed'), 'DECONOMIX_SEED', None)
+
+# GPU / performance setup
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+try:
+    cudnn.benchmark = True
+    torch.set_float32_matmul_precision('high')
+except Exception:
+    pass
+
+# Optional reproducibility via env DECONOMIX_SEED
+seed_env = cfg_get(('run','seed'), 'DECONOMIX_SEED', None)
+if seed_env is not None:
+    try:
+        seed = int(seed_env)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+            cudnn.deterministic = True
+            cudnn.benchmark = False
+    except Exception:
+        pass
 
 print("="*70)
 print("TRANSFORMER DECONVOLUTION")
 print("="*70)
 
-print("\n[STEP 1] Loading skin atlas data...")
-adata = sc.read_h5ad('Data/rna_data.h5ad')
-adata_control = adata[adata.obs['disease'] == 'control'].copy()
+print("\n[STEP 1] Loading skin atlas data or precomputed arrays...")
+if prepared_dir and os.path.exists(os.path.join(prepared_dir, 'X_train.npy')):
+    use_precomputed = True
+    print(f"Using precomputed arrays from: {prepared_dir}")
+    X_train_bulk = np.load(os.path.join(prepared_dir, 'X_train.npy'))
+    y_train_props = np.load(os.path.join(prepared_dir, 'y_train.npy'))
+    X_val_bulk = np.load(os.path.join(prepared_dir, 'X_val.npy'))
+    y_val_props = np.load(os.path.join(prepared_dir, 'y_val.npy'))
+    X_test_bulk = np.load(os.path.join(prepared_dir, 'X_test.npy'))
+    y_test_props = np.load(os.path.join(prepared_dir, 'y_test.npy'))
+    with open(os.path.join(prepared_dir, 'cell_types.txt'), 'r', encoding='utf-8') as f:
+        cell_types = [line.strip() for line in f if line.strip()]
+else:
+    adata = sc.read_h5ad(dataset_path)
+if not use_precomputed:
+    adata_control = adata[adata.obs['disease'] == 'control'].copy()
 
-immune_keywords = ['T cell', 'B cell', 'NK cell', 'Macrophage', 'Monocyte',
-                   'DC', 'Plasma cell', 'Mast cell']
-mask = adata_control.obs['cell_type'].str.lower().apply(
-    lambda x: any(k.lower() in x for k in immune_keywords)
-)
-adata_immune = adata_control[mask].copy()
+    immune_keywords = ['T cell', 'B cell', 'NK cell', 'Macrophage', 'Monocyte',
+                       'DC', 'Plasma cell', 'Mast cell']
+    mask = adata_control.obs['cell_type'].str.lower().apply(
+        lambda x: any(k.lower() in x for k in immune_keywords)
+    )
+    adata_immune = adata_control[mask].copy()
 
-print(f"Immune cells: {adata_immune.n_obs:,}")
+    print(f"Immune cells: {adata_immune.n_obs:,}")
 
-print("\n[STEP 2] Filtering to abundant cell types...")
+if not use_precomputed:
+    print("\n[STEP 2] Filtering to abundant cell types...")
 
-cell_type_counts = adata_immune.obs['cell_type'].value_counts()
-cell_type_props = cell_type_counts / len(adata_immune)
+if not use_precomputed:
+    cell_type_counts = adata_immune.obs['cell_type'].value_counts()
+    cell_type_props = cell_type_counts / len(adata_immune)
 
-min_proportion = 0.01
-major_cell_types = cell_type_props[cell_type_props >= min_proportion].index.tolist()
+    min_proportion = 0.01
+    major_cell_types = cell_type_props[cell_type_props >= min_proportion].index.tolist()
 
-print(f"\nKeeping {len(major_cell_types)} major cell types (>{min_proportion*100}%):")
-for ct in major_cell_types:
-    print(f"  {ct}")
+    print(f"\nKeeping {len(major_cell_types)} major cell types (>{min_proportion*100}%):")
+    for ct in major_cell_types:
+        print(f"  {ct}")
 
-adata_major = adata_immune[adata_immune.obs['cell_type'].isin(major_cell_types)].copy()
-print(f"\nFiltered to {adata_major.n_obs:,} cells in {len(major_cell_types)} cell types")
+    adata_major = adata_immune[adata_immune.obs['cell_type'].isin(major_cell_types)].copy()
+    print(f"\nFiltered to {adata_major.n_obs:,} cells in {len(major_cell_types)} cell types")
 
-print("\n[STEP 3] Selecting marker genes...")
+if not use_precomputed:
+    print("\n[STEP 3] Selecting marker genes...")
 
-adata_norm = adata_major.copy()
-sc.pp.normalize_total(adata_norm, target_sum=1e4)
-sc.pp.log1p(adata_norm)
+if not use_precomputed:
+    adata_norm = adata_major.copy()
+    sc.pp.normalize_total(adata_norm, target_sum=1e4)
+    sc.pp.log1p(adata_norm)
 
-sc.pp.highly_variable_genes(adata_norm, n_top_genes=1500, flavor='seurat_v3')
-hvg = adata_norm.var_names[adata_norm.var['highly_variable']].tolist()
+    sc.pp.highly_variable_genes(adata_norm, n_top_genes=1500, flavor='seurat_v3')
+    hvg = adata_norm.var_names[adata_norm.var['highly_variable']].tolist()
 
-sc.tl.rank_genes_groups(adata_norm, 'cell_type', method='wilcoxon')
+    sc.tl.rank_genes_groups(adata_norm, 'cell_type', method='wilcoxon')
 
-marker_genes = set()
-cell_types = sorted(major_cell_types)
+    marker_genes = set()
+    cell_types = sorted(major_cell_types)
 
-for ct in cell_types:
-    genes = sc.get.rank_genes_groups_df(adata_norm, group=ct).head(150)['names']
-    marker_genes.update(genes)
+    for ct in cell_types:
+        genes = sc.get.rank_genes_groups_df(adata_norm, group=ct).head(150)['names']
+        marker_genes.update(genes)
 
-selected_genes = sorted(list(set(hvg) | marker_genes))
-print(f"Selected genes: {len(selected_genes)}")
+    selected_genes = sorted(list(set(hvg) | marker_genes))
+    print(f"Selected genes: {len(selected_genes)}")
 
-adata_filtered = adata_major[:, selected_genes].copy()
+    adata_filtered = adata_major[:, selected_genes].copy()
 
 # ============================================================================
 # STEP 4: SIMULATE TRAINING DATA
 # ============================================================================
-print("\n[STEP 4] Simulating pseudo-bulk samples...")
+if not use_precomputed:
+    print("\n[STEP 4] Simulating pseudo-bulk samples...")
 
 def simulate_bulk_advanced(adata, n_samples=10000, seed=42):
     np.random.seed(seed)
@@ -117,9 +208,10 @@ def simulate_bulk_advanced(adata, n_samples=10000, seed=42):
 
     return np.array(bulks), np.array(props)
 
-X_train_bulk, y_train_props = simulate_bulk_advanced(adata_filtered, n_samples=15000, seed=42)
-X_val_bulk, y_val_props = simulate_bulk_advanced(adata_filtered, n_samples=2000, seed=123)
-X_test_bulk, y_test_props = simulate_bulk_advanced(adata_filtered, n_samples=1000, seed=456)
+if not use_precomputed:
+    X_train_bulk, y_train_props = simulate_bulk_advanced(adata_filtered, n_samples=15000, seed=42)
+    X_val_bulk, y_val_props = simulate_bulk_advanced(adata_filtered, n_samples=2000, seed=123)
+    X_test_bulk, y_test_props = simulate_bulk_advanced(adata_filtered, n_samples=1000, seed=456)
 
 print(f"\nTraining: {X_train_bulk.shape}")
 print(f"Validation: {X_val_bulk.shape}")
@@ -201,7 +293,8 @@ class TransformerDeconvolution(nn.Module):
 
         self.global_pool = nn.AdaptiveAvgPool1d(1)
 
-        self.decoder = nn.Sequential(
+        use_dirichlet = bool(cfg_get(('train','use_dirichlet'), None, False))
+        head_layers = [
             nn.Linear(d_model, 512),
             nn.LayerNorm(512),
             nn.GELU(),
@@ -213,8 +306,11 @@ class TransformerDeconvolution(nn.Module):
             nn.Dropout(0.2),
 
             nn.Linear(256, n_cell_types),
-            nn.Softmax(dim=1)
-        )
+        ]
+        # Softmax for simplex if not using Dirichlet; Dirichlet path will map to alpha via softplus in loss
+        if not use_dirichlet:
+            head_layers.append(nn.Softmax(dim=1))
+        self.decoder = nn.Sequential(*head_layers)
 
     def forward(self, x):
         batch_size = x.size(0)
@@ -243,8 +339,24 @@ class TransformerDeconvolution(nn.Module):
 n_genes = X_train_bulk.shape[1]
 n_cell_types = len(cell_types)
 
-model = TransformerDeconvolution(n_genes, n_cell_types, d_model=512, num_heads=8, num_layers=4)
+# Model dims via config when provided
+d_model = int(cfg_get(('model','d_model'), None, 512))
+num_heads = int(cfg_get(('model','num_heads'), None, 8))
+num_layers = int(cfg_get(('model','num_layers'), None, 4))
+model = TransformerDeconvolution(n_genes, n_cell_types, d_model=d_model, num_heads=num_heads, num_layers=num_layers)
 print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+model.to(device)
+
+# EMA model for smoother validation and checkpoints
+ema_decay = float(cfg_get(('train','ema_decay'), 'DECONOMIX_EMA_DECAY', '0.999'))
+ema_model = deepcopy(model).to(device)
+for p in ema_model.parameters():
+    p.requires_grad_(False)
+
+@torch.no_grad()
+def ema_update(ema_m, model_m, decay: float):
+    for p_ema, p in zip(ema_m.parameters(), model_m.parameters()):
+        p_ema.data.mul_(decay).add_(p.data, alpha=1.0 - decay)
 
 print("\n[STEP 6] Training...")
 
@@ -261,38 +373,164 @@ X_test_t = torch.FloatTensor(X_test_scaled)
 y_test_t = torch.FloatTensor(y_test_props)
 
 train_dataset = TensorDataset(X_train_t, y_train_t)
-train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
+batch_size = int(cfg_get(('train','batch_size'), 'DECONOMIX_BATCH', '512'))
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=batch_size,
+    shuffle=True,
+    pin_memory=(device.type == 'cuda'),
+)
 
-criterion = nn.MSELoss()
-optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)
-scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=15, factor=0.5)
+eps = 1e-6
+avg_props = y_train_props.mean(axis=0)
+class_weights_np = 1.0 / (avg_props + eps)
+class_weights_np = class_weights_np / class_weights_np.mean()
+cap = float(cfg_get(('train','weight_cap'), 'DECONOMIX_WEIGHT_CAP', '3.0'))
+if cap > 0:
+    class_weights_np = np.minimum(class_weights_np, cap)
+class_weights = torch.tensor(class_weights_np, dtype=torch.float32, device=device)
 
-n_epochs = 200
-best_val_loss = float('inf')
+label_smooth = float(cfg_get(('train','label_smooth'), 'DECONOMIX_LABEL_SMOOTH', '0.01'))
+
+def apply_label_smoothing(y: torch.Tensor, smooth: float) -> torch.Tensor:
+    if smooth <= 0:
+        return y
+    c = y.size(1)
+    return (1.0 - smooth) * y + smooth / c
+
+def weighted_mse(pred, target):
+    loss = (pred - target) ** 2
+    loss = loss * class_weights
+    return loss.mean()
+
+max_lr = float(cfg_get(('train','lr_max'), None, 0.001))
+weight_decay = float(cfg_get(('train','weight_decay'), None, 1e-4))
+optimizer = optim.AdamW(model.parameters(), lr=max_lr, weight_decay=weight_decay)
+
+n_epochs = int(cfg_get(('train','epochs'), None, 200))
+best_val_corr = -1.0
 patience_counter = 0
-max_patience = 30
+max_patience = int(cfg_get(('train','patience'), None, 60))
+scaler_amp = GradScaler(enabled=(device.type == 'cuda'))
+scheduler = OneCycleLR(optimizer, max_lr=max_lr, epochs=n_epochs, steps_per_epoch=len(train_loader))
+mixup_alpha = float(cfg_get(('train','mixup_alpha'), 'DECONOMIX_MIXUP_ALPHA', '0.0'))
+use_mixup = mixup_alpha > 0
+grad_clip = float(cfg_get(('train','gradient_clip'), None, 0.0))
+use_swa = bool(cfg_get(('train','use_swa'), None, False))
+swa_snapshots = int(cfg_get(('train','swa_snapshots'), None, 3))
+cos_w = float(cfg_get(('train','cosine_weight'), None, 0.0))
+corr_w = float(cfg_get(('train','corr_weight'), None, 0.0))
+if use_swa:
+    swa_model = AveragedModel(ema_model)
+    swa_count = 0
 
 print("\nTraining progress:")
 print(f"{'Epoch':>6} {'Train Loss':>12} {'Val Loss':>12} {'Val Corr':>12}")
 print("-" * 48)
 
-for epoch in range(n_epochs):
+epoch_iter = range(n_epochs)
+if progress_enabled:
+    epoch_iter = tqdm(epoch_iter, desc="Epochs", dynamic_ncols=True)
+
+for epoch in epoch_iter:
     model.train()
     train_loss = 0
-    for batch_X, batch_y in train_loader:
-        optimizer.zero_grad()
-        outputs = model(batch_X)
-        loss = criterion(outputs, batch_y)
-        loss.backward()
-        optimizer.step()
+    batch_iter = train_loader
+    if progress_enabled:
+        batch_iter = tqdm(train_loader, desc=f"Train {epoch+1}/{n_epochs}", leave=False, dynamic_ncols=True)
+
+    for batch_X, batch_y in batch_iter:
+        batch_X = batch_X.to(device, non_blocking=True)
+        batch_y = batch_y.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        # Optional MixUp
+        if use_mixup:
+            lam = np.random.beta(mixup_alpha, mixup_alpha)
+            idx = torch.randperm(batch_X.size(0), device=device)
+            batch_X_m = lam * batch_X + (1.0 - lam) * batch_X[idx]
+            batch_y_m = lam * batch_y + (1.0 - lam) * batch_y[idx]
+        else:
+            batch_X_m, batch_y_m = batch_X, batch_y
+        # Label smoothing
+        batch_y_m = apply_label_smoothing(batch_y_m, label_smooth)
+        with autocast(enabled=(device.type == 'cuda')):
+            outputs = model(batch_X_m)
+            # Choose loss: Dirichlet NLL or weighted MSE
+            if bool(cfg_get(('train','use_dirichlet'), None, False)):
+                # Convert head outputs to Dirichlet concentration alpha via softplus
+                dirichlet_eps = float(cfg_get(('train','dirichlet_eps'), None, 1e-6))
+                label_tau = float(cfg_get(('train','label_tau'), None, 1e-4))
+                alpha = F.softplus(outputs) + dirichlet_eps
+                y_s = apply_label_smoothing(batch_y_m, label_tau)
+                y_s = torch.clamp(y_s, min=dirichlet_eps)
+                # Dirichlet NLL
+                loss = (
+                    torch.lgamma(alpha.sum(dim=1))
+                    - torch.lgamma(alpha).sum(dim=1)
+                    - ((alpha - 1.0) * torch.log(y_s)).sum(dim=1)
+                ).mean()
+            else:
+                loss = weighted_mse(outputs, batch_y_m)
+            # Cosine auxiliary loss
+            if cos_w > 0:
+                # For Dirichlet, compare normalized alpha means; else use outputs directly
+                if bool(cfg_get(('train','use_dirichlet'), None, False)):
+                    p = alpha / alpha.sum(dim=1, keepdim=True)
+                else:
+                    p = outputs
+                cos_loss = (1 - F.cosine_similarity(p, batch_y_m, dim=1)).mean()
+                loss = loss + cos_w * cos_loss
+            # Correlation-aware loss (negative Pearson correlation)
+            if corr_w > 0:
+                if bool(cfg_get(('train','use_dirichlet'), None, False)):
+                    p = alpha / alpha.sum(dim=1, keepdim=True)
+                # else p already assigned above when cos_w>0; ensure p exists
+                else:
+                    p = outputs
+                px = p - p.mean(dim=0, keepdim=True)
+                yx = batch_y_m - batch_y_m.mean(dim=0, keepdim=True)
+                cov = (px * yx).mean(dim=0)
+                stdp = (px.pow(2).mean(dim=0) + 1e-8).sqrt()
+                stdy = (yx.pow(2).mean(dim=0) + 1e-8).sqrt()
+                corr = cov / (stdp * stdy)
+                corr_loss = 1.0 - corr.mean()
+                loss = loss + corr_w * corr_loss
+        scaler_amp.scale(loss).backward()
+        if grad_clip > 0:
+            scaler_amp.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+        scaler_amp.step(optimizer)
+        scaler_amp.update()
+        scheduler.step()
+        ema_update(ema_model, model, ema_decay)
         train_loss += loss.item()
 
     train_loss /= len(train_loader)
 
     model.eval()
-    with torch.no_grad():
-        val_preds = model(X_val_t).numpy()
-        val_loss = criterion(model(X_val_t), y_val_t).item()
+    with torch.no_grad(), autocast(enabled=(device.type == 'cuda')):
+        # Validate with EMA (or SWA-on-EMA) weights
+        eval_model = ema_model
+        if use_swa and (epoch + 1) >= n_epochs - swa_snapshots:
+            # accumulate SWA snapshots from EMA in the tail epochs
+            swa_model.update_parameters(ema_model)
+            swa_count += 1
+            eval_model = swa_model
+        val_out = eval_model(X_val_t.to(device))
+        if bool(cfg_get(('train','use_dirichlet'), None, False)):
+            alpha_v = F.softplus(val_out) + float(cfg_get(('train','dirichlet_eps'), None, 1e-6))
+            p_v = alpha_v / alpha_v.sum(dim=1, keepdim=True)
+            val_preds = p_v.detach().cpu().numpy()
+            # compute proxy loss against smoothed labels
+            yv_s = apply_label_smoothing(y_val_t.to(device), float(cfg_get(('train','label_tau'), None, 1e-4)))
+            val_loss = (
+                torch.lgamma(alpha_v.sum(dim=1))
+                - torch.lgamma(alpha_v).sum(dim=1)
+                - ((alpha_v - 1.0) * torch.log(torch.clamp(yv_s, min=1e-6))).sum(dim=1)
+            ).mean().item()
+        else:
+            val_preds = val_out.detach().cpu().numpy()
+            val_loss = weighted_mse(val_out, y_val_t.to(device)).item()
 
         val_corrs = []
         for i in range(n_cell_types):
@@ -300,22 +538,55 @@ for epoch in range(n_epochs):
             val_corrs.append(corr)
         avg_val_corr = np.mean(val_corrs)
 
-    scheduler.step(val_loss)
+    # OneCycleLR is stepped per batch; no val step here
+
+    if progress_enabled:
+        try:
+            epoch_iter.set_postfix(train=f"{train_loss:.4f}", val=f"{val_loss:.4f}", corr=f"{avg_val_corr:.3f}")
+        except Exception:
+            pass
 
     if (epoch + 1) % 10 == 0:
         print(f"{epoch+1:6d} {train_loss:12.6f} {val_loss:12.6f} {avg_val_corr:12.3f}")
 
-    if val_loss < best_val_loss:
-        best_val_loss = val_loss
+    if avg_val_corr > best_val_corr + 1e-4:
+        best_val_corr = avg_val_corr
         patience_counter = 0
-        torch.save(model.state_dict(), 'best_model_transformer.pth')
+        os.makedirs(outdir, exist_ok=True)
+        # Save EMA (or SWA-EMA) weights as checkpoint
+        to_save = ema_model
+        if use_swa and swa_count > 0:
+            to_save = swa_model
+        torch.save(to_save.state_dict(), os.path.join(outdir, 'best_model_transformer.pth'))
+        try:
+            with open(os.path.join(outdir, 'transformer_scaler.pkl'), 'wb') as f:
+                pickle.dump(scaler, f)
+            cfg = {
+                'batch_size': batch_size,
+                'optimizer': 'AdamW',
+                'lr_max': 0.001,
+                'weight_decay': 1e-4,
+                'epochs': n_epochs,
+                'scheduler': 'OneCycleLR',
+                'class_weights': class_weights_np.tolist(),
+                'best_val_corr': float(best_val_corr),
+                'ema_decay': ema_decay,
+                'mixup_alpha': mixup_alpha,
+                'label_smooth': label_smooth,
+                'seed': seed_env,
+            }
+            with open(os.path.join(outdir, 'transformer_config.json'), 'w', encoding='utf-8') as f:
+                json.dump(cfg, f, indent=2)
+        except Exception:
+            pass
     else:
         patience_counter += 1
         if patience_counter >= max_patience:
             print(f"\nEarly stopping at epoch {epoch+1}")
             break
 
-model.load_state_dict(torch.load('best_model_transformer.pth'))
+outdir = outdir
+model.load_state_dict(torch.load(os.path.join(outdir, 'best_model_transformer.pth')))
 
 print("\n" + "="*70)
 print("FINAL EVALUATION")
@@ -323,7 +594,7 @@ print("="*70)
 
 model.eval()
 with torch.no_grad():
-    test_predictions = model(X_test_t).numpy()
+    test_predictions = model(X_test_t.to(device)).detach().cpu().numpy()
 
 print(f"\n{'Cell Type':<30} {'Spearman ρ':>12} {'MAE':>10} {'Avg Prop':>10}")
 print("-" * 64)
@@ -367,8 +638,8 @@ for idx in range(len(cell_types), 9):
 plt.suptitle(f'Transformer Deconvolution - Avg ρ = {avg_corr:.3f}',
              fontsize=16, fontweight='bold')
 plt.tight_layout()
-plt.savefig('transformer_deconvolution.png', dpi=300, bbox_inches='tight')
-print("Saved: transformer_deconvolution.png")
+plt.savefig(os.path.join(outdir, 'transformer_deconvolution.png'), dpi=300, bbox_inches='tight')
+print(f"Saved: {os.path.join(outdir, 'transformer_deconvolution.png')}")
 
 perf_df = pd.DataFrame({
     'cell_type': cell_types,
@@ -376,7 +647,7 @@ perf_df = pd.DataFrame({
     'mae': mae_scores,
     'mean_proportion': y_test_props.mean(axis=0)
 })
-perf_df.to_csv('performance_transformer.csv', index=False)
+perf_df.to_csv(os.path.join(outdir, 'performance_transformer.csv'), index=False)
 
 print("\n" + "="*70)
 print("TRANSFORMER COMPLETE")

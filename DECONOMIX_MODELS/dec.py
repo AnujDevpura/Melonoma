@@ -41,8 +41,11 @@ DATA_PATH = 'Data/rna_data.h5ad'  # <--- Verify this path matches your file
 print("\n[1/6] Loading and Filtering Single-Cell Data...")
 
 if not os.path.exists(DATA_PATH):
-    raise FileNotFoundError(f"Could not find data at {DATA_PATH}")
-
+    fallback = 'rna_data.h5ad'
+    if os.path.exists(fallback):
+        DATA_PATH = fallback
+    else:
+        raise FileNotFoundError(f"Could not find data at {DATA_PATH} or {fallback}")
 adata = sc.read_h5ad(DATA_PATH)
 adata_control = adata[adata.obs['disease'] == 'control'].copy()
 

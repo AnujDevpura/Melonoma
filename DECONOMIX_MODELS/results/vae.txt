@@ -1,0 +1,32 @@
+======================================================================
+FINAL EVALUATION - VAE
+======================================================================
+
+Cell Type                        Spearman ρ        MAE   Avg Prop
+----------------------------------------------------------------
+CD4 T cell                            0.679     0.0073     0.3899
+CD8 T cell                            0.121     0.0052     0.0683
+Macrophage                            0.452     0.0040     0.0495
+Mast cell                             0.061     0.0025     0.0150
+Monocyte                              0.615     0.0055     0.1456
+NK cell                               0.688     0.0044     0.0899
+Naive B cell                          0.750     0.0029     0.0495
+cDC1                                  0.248     0.0026     0.0178
+cDC2                                  0.567     0.0062     0.1745
+----------------------------------------------------------------
+AVERAGE                               0.465     0.0045
+
+[Creating visualizations...]
+Saved: C:\My Projects\Melonoma\DECONOMIX_MODELS\results\vae_deconvolution.png
+
+[Analyzing latent space...]
+Saved: C:\My Projects\Melonoma\DECONOMIX_MODELS\results\vae_latent_space.png
+
+======================================================================
+VAE COMPLETE
+======================================================================
+
+FINAL RESULTS:
+  Average Spearman: 0.465
+  Latent dimension: 128
+  Architecture: Encoder-Decoder with disentangled latent space
